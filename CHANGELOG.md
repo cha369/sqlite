@@ -1,5 +1,11 @@
 # Changelog
 
+ - 2026-02-17 v1.46.0:
+  - Enable ColumnTypeScanType to report time.Time instead of string for TEXT
+    columns declared as DATE, DATETIME, TIME, or TIMESTAMP via a new
+    `_texttotime` URI parameter.
+  - See [pull request #1](https://github.com/modernc-org/sqlite/pull/1), thanks devhaozi!
+
  - 2026-02-09  v1.45.0:
   - Introduce vtab subpackage (modernc.org/sqlite/vtab) exposing Module, Table, Cursor, and IndexInfo API for Go virtual tables.
   - Wire vtab registration into the driver: vtab.RegisterModule installs modules globally and each new connection calls sqlite3_create_module_v2.

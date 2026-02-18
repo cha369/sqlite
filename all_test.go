@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"embed"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -3714,4 +3715,100 @@ func TestIsReadOnly(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// https://github.com/modernc-org/sqlite/issues/2
+func TestTxCommitBusyFix(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "issue2.db")
+
+	// Helper to open a connection
+	openDB := func() *sql.DB {
+		db, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Fatalf("failed to open db: %v", err)
+		}
+		db.SetMaxOpenConns(1)
+		return db
+	}
+
+	// Create the table
+	func() {
+		db := openDB()
+		defer db.Close()
+		if _, err := db.Exec("create table foo (bar integer primary key)"); err != nil {
+			t.Fatalf("failed to create table: %v", err)
+		}
+	}()
+
+	// Open two separate connections to the same DB file
+	db1 := openDB()
+	defer db1.Close()
+
+	db2 := openDB()
+	defer db2.Close()
+
+	ctx := context.Background()
+
+	// 1. Start a transaction on DB1
+	tx1, err := db1.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx1.Rollback() // Cleanup if test fails early
+
+	// 2. Start a transaction on DB2
+	tx2, err := db2.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx2.Rollback()
+
+	// 3. Acquire a SHARED lock on DB2 by reading
+	if _, err := tx2.ExecContext(ctx, "select * from foo"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 4. Perform a write on DB1 (acquires RESERVED lock)
+	if _, err := tx1.ExecContext(ctx, "insert into foo (bar) values (42)"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 5. Attempt to commit DB1.
+	// This requires an EXCLUSIVE lock, but DB2 holds a SHARED lock.
+	// This MUST fail with SQLITE_BUSY.
+	err = tx1.Commit()
+	if err == nil {
+		t.Fatal("expected commit error (SQLITE_BUSY), got nil")
+	}
+
+	// Verify the error type
+	var sqliteErr *Error
+	if errors.As(err, &sqliteErr) {
+		if sqliteErr.Code() != sqlite3.SQLITE_BUSY {
+			t.Fatalf("expected SQLITE_BUSY, got %v", sqliteErr)
+		}
+	} else {
+		t.Fatalf("expected sqlite.Error, got %T: %v", err, err)
+	}
+
+	// 6. The standard database/sql behavior dictates that once Commit() returns,
+	// the transaction is conceptually "done" from the driver's perspective.
+	// Calling Rollback() here should return sql.ErrTxDone.
+	if err := tx1.Rollback(); err != sql.ErrTxDone {
+		t.Fatalf("expected sql.ErrTxDone from Rollback, got %v", err)
+	}
+
+	// 7. CRITICAL: Try to use the connection again.
+	// WITHOUT THE FIX: The underlying connection is still in a transaction state.
+	//                  BeginTx will fail with "cannot start a transaction within a transaction".
+	// WITH THE FIX:    The Commit() method detected the failure + active transaction
+	//                  and performed an internal rollback. The connection is clean.
+	tx3, err := db1.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("connection is poisoned after failed commit: %v", err)
+	}
+
+	// If we got here, the fix is working. Clean up.
+	tx3.Rollback()
 }

@@ -13,6 +13,10 @@ type Value = driver.Value
 
 // Blob represents an open BLOB handle for direct read/write access to a BLOB column.
 // It wraps the SQLite sqlite3_blob* handle and provides efficient binary I/O.
+//
+// Blob is NOT safe for concurrent use. Each Blob should be used by a single goroutine
+// and must be closed after use. The typical usage pattern is within a single callback
+// or transaction scope.
 type Blob struct {
 	handle uintptr
 	read   func(handle uintptr, offset int64, p []byte) error

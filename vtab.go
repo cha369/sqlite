@@ -192,6 +192,15 @@ func vtabConfig(tls *libc.TLS, db uintptr, op int32, args ...int32) error {
 
 // vtabNewContext creates a fully-featured vtab.Context for use in callbacks.
 // This includes Exec and OpenBlob capabilities for shadow table operations.
+//
+// This function should only be called from callbacks where SQL execution is safe:
+//   - xCreate, xConnect: for creating shadow tables and indexes
+//   - xUpdate: for maintaining auxiliary data during insert/update/delete
+//   - xBegin, xSync, xCommit, xRollback: for transaction-level operations
+//   - xSavepoint, xRelease, xRollbackTo: for savepoint operations
+//
+// It MUST NOT be called from xBestIndex or query callbacks (xFilter, xNext, xColumn, xRowid)
+// as doing so may cause deadlocks or undefined behavior.
 func vtabNewContext(tls *libc.TLS, db uintptr) vtab.Context {
 	execSQL := func(sql string, args []driver.Value) error {
 		return vtabExecDirect(tls, db, sql, args)

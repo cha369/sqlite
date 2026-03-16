@@ -11,6 +11,56 @@ import (
 // module authors while remaining compatible with the driver.
 type Value = driver.Value
 
+// Blob represents an open BLOB handle for direct read/write access to a BLOB column.
+// It wraps the SQLite sqlite3_blob* handle and provides efficient binary I/O.
+type Blob struct {
+	handle uintptr
+	read   func(handle uintptr, offset int64, p []byte) error
+	write  func(handle uintptr, offset int64, p []byte) error
+	close  func(handle uintptr) error
+}
+
+// NewBlob creates a new Blob with the given handle and operations.
+// This is intended for use by the engine to create Blob instances.
+func NewBlob(handle uintptr, read func(uintptr, int64, []byte) error, write func(uintptr, int64, []byte) error, close func(uintptr) error) *Blob {
+	return &Blob{handle: handle, read: read, write: write, close: close}
+}
+
+// Read reads data from the BLOB at the given offset into p.
+// Returns the number of bytes read, which should always be len(p) on success.
+func (b *Blob) Read(offset int64, p []byte) (int, error) {
+	if b.handle == 0 {
+		return 0, errors.New("vtab: blob handle is closed")
+	}
+	if err := b.read(b.handle, offset, p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// Write writes data to the BLOB at the given offset from p.
+// Returns the number of bytes written, which should always be len(p) on success.
+func (b *Blob) Write(offset int64, p []byte) (int, error) {
+	if b.handle == 0 {
+		return 0, errors.New("vtab: blob handle is closed")
+	}
+	if err := b.write(b.handle, offset, p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// Close closes the BLOB handle and releases resources.
+// After Close, all operations on the Blob will return an error.
+func (b *Blob) Close() error {
+	if b.handle == 0 {
+		return nil
+	}
+	err := b.close(b.handle)
+	b.handle = 0
+	return err
+}
+
 // Context carries information that a Module may need when creating or
 // connecting a table instance. It intentionally does not expose *sql.DB to
 // avoid leaking database/sql internals into the vtab API. Additional fields
@@ -21,6 +71,23 @@ type Context struct {
 	constraintSupport func() error
 	// config issues sqlite3_vtab_config calls for other vtab options.
 	config func(op int32, args ...int32) error
+	// execSQL executes SQL using the underlying SQLite connection.
+	// This is optional; if nil, Exec() will return an error.
+	execSQL func(sql string, args []driver.Value) error
+	// openBlob opens a BLOB handle for direct read/write access.
+	openBlob func(db, table, column string, rowid int64, write bool) (*Blob, error)
+	// noChangeCheck checks if a column value is unchanged during UPDATE.
+	// Used by ValueNoChange. Optional; returns false if not available.
+	noChangeCheck func(colIndex int) bool
+	// inFirst returns the first value in an IN constraint list.
+	// Returns (Value, true) if available, (nil, false) otherwise.
+	inFirst func(valPtr uintptr) (Value, bool)
+	// inNext returns the next value in an IN constraint list.
+	// Returns (Value, true) if more values, (nil, false) at end.
+	inNext func(valPtr uintptr) (Value, bool)
+	// valPtrs stores the raw sqlite3_value pointers for the current operation.
+	// Used by IN iteration. May be nil if not applicable.
+	valPtrs []uintptr
 }
 
 // Declare must be called by a module from within Create or Connect to declare
@@ -54,6 +121,154 @@ func (c Context) Config(op int32, args ...int32) error {
 	return c.config(op, args...)
 }
 
+// Exec executes a SQL statement within the current transaction.
+// Unlike *sql.DB.Exec(), this does not cause deadlock during vtab callbacks
+// because it uses the same underlying SQLite connection/session.
+//
+// Use cases include:
+//   - Creating shadow tables during Create/Connect
+//   - Syncing auxiliary data during Update/Insert/Delete
+//   - Maintaining indexes or materialized views
+//
+// Note: This method is available only when the engine provides transaction
+// context support. If Exec is called when not available, it returns an error.
+// Modules should check the error and gracefully degrade if needed.
+func (c Context) Exec(sql string, args ...driver.Value) error {
+	if c.execSQL == nil {
+		return errors.New("vtab: Exec not available in this context")
+	}
+	return c.execSQL(sql, args)
+}
+
+// OpenBlob opens a BLOB for direct read/write access.
+// This is more efficient than using SQL for binary data operations,
+// especially for large BLOBs or when modifying only portions of a BLOB.
+//
+// Parameters:
+//   - db: database name (typically "main")
+//   - table: table name containing the BLOB column
+//   - column: column name of the BLOB
+//   - rowid: rowid of the row containing the BLOB
+//   - write: true for read/write access, false for read-only
+//
+// Returns a Blob handle that must be closed after use.
+//
+// Example:
+//
+//	blob, err := ctx.OpenBlob("main", "chunks", "vector_data", rowid, true)
+//	if err != nil { return err }
+//	defer blob.Close()
+//	blob.Write(offset, vectorData)
+func (c Context) OpenBlob(db, table, column string, rowid int64, write bool) (*Blob, error) {
+	if c.openBlob == nil {
+		return nil, errors.New("vtab: OpenBlob not available in this context")
+	}
+	return c.openBlob(db, table, column, rowid, write)
+}
+
+// ValueNoChange checks if the column at the given index is unchanged during
+// an UPDATE operation. This is useful for optimizing updates by skipping
+// columns that haven't been modified.
+//
+// Returns true if the column value is unchanged, false if changed or if
+// the check is not available (e.g., during INSERT or when called outside
+// of an UPDATE callback).
+//
+// Example:
+//
+//	func (t *MyTable) Update(ctx Context, oldRowid int64, cols []Value, newRowid *int64) error {
+//	    for i, col := range cols {
+//	        if ctx.ValueNoChange(i) {
+//	            continue // Skip unchanged column
+//	        }
+//	        // Process changed column
+//	    }
+//	}
+func (c Context) ValueNoChange(colIndex int) bool {
+	if c.noChangeCheck == nil || colIndex < 0 {
+		return false
+	}
+	return c.noChangeCheck(colIndex)
+}
+
+// InIterator provides iteration over IN constraint values.
+// It is returned by Context.InIterate to iterate through the elements
+// of an IN(...) expression.
+type InIterator struct {
+	valPtr  uintptr
+	inFirst func(uintptr) (Value, bool)
+	inNext  func(uintptr) (Value, bool)
+	current Value
+	done    bool
+}
+
+// Next advances the iterator. Returns true if there are more values.
+// The current value can be accessed via Value() after a successful Next().
+func (it *InIterator) Next() bool {
+	if it.done {
+		return false
+	}
+	if it.current == nil {
+		// First call
+		if it.inFirst == nil {
+			it.done = true
+			return false
+		}
+		v, ok := it.inFirst(it.valPtr)
+		if !ok {
+			it.done = true
+			return false
+		}
+		it.current = v
+		return true
+	}
+	// Subsequent calls
+	if it.inNext == nil {
+		it.done = true
+		return false
+	}
+	v, ok := it.inNext(it.valPtr)
+	if !ok {
+		it.done = true
+		return false
+	}
+	it.current = v
+	return true
+}
+
+// Value returns the current value in the iteration.
+// Must be called after Next() returns true.
+func (it *InIterator) Value() Value {
+	return it.current
+}
+
+// InIterate creates an iterator for an IN constraint value.
+// The argIndex corresponds to the position in the Values slice passed
+// to Filter (0-based), which should have been identified as an IN
+// constraint during BestIndex.
+//
+// Example:
+//
+//	func (c *MyCursor) Filter(idxNum int, idxStr string, vals []Value) error {
+//	    // Assuming constraint at index 0 is an IN constraint
+//	    it := ctx.InIterate(vals, 0)
+//	    for it.Next() {
+//	        v := it.Value()
+//	        // Process each value in the IN list
+//	    }
+//	}
+func (c Context) InIterate(vals []Value, argIndex int) *InIterator {
+	if c.inFirst == nil || c.valPtrs == nil || argIndex < 0 || argIndex >= len(c.valPtrs) {
+		return &InIterator{done: true}
+	}
+	return &InIterator{
+		valPtr:  c.valPtrs[argIndex],
+		inFirst: c.inFirst,
+		inNext:  c.inNext,
+		done:    false,
+	}
+}
+
 // NewContext is used by the engine to create a Context bound to the current
 // xCreate/xConnect call. External modules should not need to call this.
 func NewContext(declare func(string) error) Context { return Context{declare: declare} }
@@ -68,6 +283,83 @@ func NewContextWithConstraintSupport(declare func(string) error, constraintSuppo
 // enable constraint support and other sqlite3_vtab_config options.
 func NewContextWithConfig(declare func(string) error, constraintSupport func() error, config func(op int32, args ...int32) error) Context {
 	return Context{declare: declare, constraintSupport: constraintSupport, config: config}
+}
+
+// NewContextWithExec creates a Context with full functionality including
+// the ability to execute SQL within the current transaction.
+// This should be used for callbacks that need to perform additional SQL
+// operations (e.g., creating shadow tables, syncing auxiliary data).
+func NewContextWithExec(
+	declare func(string) error,
+	constraintSupport func() error,
+	config func(op int32, args ...int32) error,
+	execSQL func(sql string, args []driver.Value) error,
+) Context {
+	return Context{
+		declare:           declare,
+		constraintSupport: constraintSupport,
+		config:            config,
+		execSQL:           execSQL,
+	}
+}
+
+// BlobOps contains the operations for BLOB access.
+type BlobOps struct {
+	Open  func(db, table, column string, rowid int64, write bool) (*Blob, error)
+	Read  func(handle uintptr, offset int64, p []byte) error
+	Write func(handle uintptr, offset int64, p []byte) error
+	Close func(handle uintptr) error
+}
+
+// NewContextWithBlob creates a Context with BLOB access capabilities.
+// This is the most feature-complete constructor for modules that need
+// both SQL execution and efficient BLOB I/O.
+func NewContextWithBlob(
+	declare func(string) error,
+	constraintSupport func() error,
+	config func(op int32, args ...int32) error,
+	execSQL func(sql string, args []driver.Value) error,
+	ops *BlobOps,
+) Context {
+	return Context{
+		declare:           declare,
+		constraintSupport: constraintSupport,
+		config:            config,
+		execSQL:           execSQL,
+		openBlob: func(db, table, column string, rowid int64, write bool) (*Blob, error) {
+			return ops.Open(db, table, column, rowid, write)
+		},
+	}
+}
+
+// UpdateContextConfig contains configuration for creating a Context
+// used during xUpdate callbacks. This enables nochange detection.
+type UpdateContextConfig struct {
+	NoChangeCheck func(colIndex int) bool
+}
+
+// NewContextForUpdate creates a Context for xUpdate callbacks with
+// nochange detection support.
+func NewContextForUpdate(base Context, cfg *UpdateContextConfig) Context {
+	base.noChangeCheck = cfg.NoChangeCheck
+	return base
+}
+
+// FilterContextConfig contains configuration for creating a Context
+// used during xFilter callbacks. This enables IN constraint iteration.
+type FilterContextConfig struct {
+	ValPtrs []uintptr                   // Raw sqlite3_value pointers
+	InFirst func(uintptr) (Value, bool) // IN iteration start
+	InNext  func(uintptr) (Value, bool) // IN iteration next
+}
+
+// NewContextForFilter creates a Context for xFilter callbacks with
+// IN constraint iteration support.
+func NewContextForFilter(base Context, cfg *FilterContextConfig) Context {
+	base.valPtrs = cfg.ValPtrs
+	base.inFirst = cfg.InFirst
+	base.inNext = cfg.InNext
+	return base
 }
 
 // Module represents a virtual table module, analogous to sqlite3_module in
@@ -119,6 +411,32 @@ type Transactional interface {
 	RollbackTo(i int) error
 }
 
+// TransactionalWithContext can be implemented by a Table to handle transaction-related
+// callbacks with access to Context for executing SQL and BLOB operations.
+// This enables modules to perform efficient I/O during transaction commits.
+//
+// When both Transactional and TransactionalWithContext are implemented,
+// TransactionalWithContext takes precedence.
+//
+// Example:
+//
+//	func (t *MyTable) Commit(ctx Context) error {
+//	    // Use ctx.Exec() or ctx.OpenBlob() for efficient operations
+//	    blob, _ := ctx.OpenBlob("main", "shadow", "data", rowid, true)
+//	    defer blob.Close()
+//	    blob.Write(0, data)
+//	    return nil
+//	}
+type TransactionalWithContext interface {
+	Begin(ctx Context) error
+	Sync(ctx Context) error
+	Commit(ctx Context) error
+	Rollback(ctx Context) error
+	Savepoint(ctx Context, i int) error
+	Release(ctx Context, i int) error
+	RollbackTo(ctx Context, i int) error
+}
+
 // Cursor represents a cursor over a virtual table (sqlite3_vtab_cursor).
 type Cursor interface {
 	// Filter corresponds to xFilter. idxNum and idxStr are the chosen index
@@ -142,6 +460,34 @@ type Cursor interface {
 	Close() error
 }
 
+// CursorWithContext can be implemented by a Cursor to handle xFilter
+// with access to Context for IN constraint iteration and other capabilities.
+//
+// When both Cursor and CursorWithContext are implemented, the FilterWithContext
+// method is preferred. This enables:
+//   - IN constraint iteration via ctx.InIterate()
+//   - Efficient handling of IN (...) expressions
+//
+// Example:
+//
+//	func (c *MyCursor) FilterWithContext(ctx Context, idxNum int, idxStr string, vals []Value) error {
+//	    // Iterate over IN constraint values
+//	    it := ctx.InIterate(vals, 0)
+//	    for it.Next() {
+//	        v := it.Value()
+//	        // Process each value
+//	    }
+//	    return nil
+//	}
+type CursorWithContext interface {
+	FilterWithContext(ctx Context, idxNum int, idxStr string, vals []Value) error
+	Next() error
+	Eof() bool
+	Column(col int) (Value, error)
+	Rowid() (int64, error)
+	Close() error
+}
+
 // Updater can be implemented by a Table to support writes via xUpdate.
 //
 // Semantics follow SQLite's xUpdate:
@@ -154,6 +500,27 @@ type Updater interface {
 	Insert(cols []Value, rowid *int64) error
 	Update(oldRowid int64, cols []Value, newRowid *int64) error
 	Delete(oldRowid int64) error
+}
+
+// UpdaterWithContext can be implemented by a Table to support writes via xUpdate
+// with access to Context for executing SQL and BLOB operations.
+//
+// This interface enables modules to:
+//   - Sync shadow tables during Insert/Update/Delete using Context.Exec
+//   - Directly write binary data to shadow tables using Context.OpenBlob
+//   - Achieve better performance by avoiding intermediate SQL parsing
+//
+// When both Updater and UpdaterWithContext are implemented, UpdaterWithContext
+// takes precedence.
+//
+// Semantics follow SQLite's xUpdate:
+//   - Delete: Delete(ctx, oldRowid) is called.
+//   - Insert: Insert(ctx, cols, rowid) is called.
+//   - Update: Update(ctx, oldRowid, cols, newRowid) is called.
+type UpdaterWithContext interface {
+	Insert(ctx Context, cols []Value, rowid *int64) error
+	Update(ctx Context, oldRowid int64, cols []Value, newRowid *int64) error
+	Delete(ctx Context, oldRowid int64) error
 }
 
 // ConstraintOp describes the operator used in a constraint on a virtual
@@ -195,6 +562,10 @@ type Constraint struct {
 	// Omit requests SQLite to omit the corresponding constraint from the
 	// parent query if the virtual table fully handles it.
 	Omit bool
+	// IsIn indicates whether this constraint represents an IN(...) expression.
+	// When true, the corresponding Value in Filter can be iterated using
+	// Value.InFirst() and Value.InNext() to access each element.
+	IsIn bool
 }
 
 // OrderBy describes a single ORDER BY term for a query involving a virtual
@@ -226,6 +597,46 @@ type IndexInfo struct {
 	// ColUsed is a bitmask indicating which columns are used by the query.
 	// Bit N is set if column N is referenced.
 	ColUsed uint64
+
+	// Internal fields used by the engine to support IN constraint handling.
+	// Modules should not access these directly.
+	_isIn     func(iCons int) bool        // Check if constraint is IN
+	_handleIn func(iCons int, handle int) // Declare handling of IN
+}
+
+// IsInConstraint returns true if the constraint at the given index is an
+// IN(...) expression. This is useful in BestIndex to optimize IN queries.
+func (ii *IndexInfo) IsInConstraint(iCons int) bool {
+	if ii._isIn == nil || iCons < 0 || iCons >= len(ii.Constraints) {
+		return false
+	}
+	return ii._isIn(iCons)
+}
+
+// HandleInConstraint tells SQLite that the virtual table will handle the
+// IN constraint at the given index. Set handle=true to declare handling,
+// or false to let SQLite handle it via the normal evaluation path.
+func (ii *IndexInfo) HandleInConstraint(iCons int, handle bool) {
+	if ii._handleIn == nil || iCons < 0 || iCons >= len(ii.Constraints) {
+		return
+	}
+	h := 0
+	if handle {
+		h = 1
+	}
+	ii._handleIn(iCons, h)
+}
+
+// SetIsInFunc sets the internal function for checking IN constraints.
+// This is used by the engine and should not be called by modules.
+func (ii *IndexInfo) SetIsInFunc(fn func(iCons int) bool) {
+	ii._isIn = fn
+}
+
+// SetHandleInFunc sets the internal function for handling IN constraints.
+// This is used by the engine and should not be called by modules.
+func (ii *IndexInfo) SetHandleInFunc(fn func(iCons int, handle int)) {
+	ii._handleIn = fn
 }
 
 // Index flag values for IndexInfo.IdxFlags.

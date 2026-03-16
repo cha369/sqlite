@@ -5,9 +5,11 @@
 package sqlite // import "modernc.org/sqlite"
 
 import (
+	"database/sql/driver"
 	"fmt"
 	"math"
 	"sync"
+	"time"
 	"unsafe"
 
 	"modernc.org/libc"
@@ -73,6 +75,7 @@ type goModule struct {
 type goTable struct {
 	mod  *goModule
 	impl vtab.Table
+	db   uintptr // SQLite db handle for Context creation
 }
 
 // goCursor wraps a vtab.Cursor implementation and remembers its table.
@@ -187,6 +190,45 @@ func vtabConfig(tls *libc.TLS, db uintptr, op int32, args ...int32) error {
 	return nil
 }
 
+// vtabNewContext creates a fully-featured vtab.Context for use in callbacks.
+// This includes Exec and OpenBlob capabilities for shadow table operations.
+func vtabNewContext(tls *libc.TLS, db uintptr) vtab.Context {
+	execSQL := func(sql string, args []driver.Value) error {
+		return vtabExecDirect(tls, db, sql, args)
+	}
+
+	blobOps := &vtab.BlobOps{
+		Open: func(dbName, table, column string, rowid int64, write bool) (*vtab.Blob, error) {
+			return vtabBlobOpen(tls, db, dbName, table, column, rowid, write)
+		},
+		Read:  func(h uintptr, off int64, p []byte) error { return vtabBlobRead(tls, h, off, p) },
+		Write: func(h uintptr, off int64, p []byte) error { return vtabBlobWrite(tls, h, off, p) },
+		Close: func(h uintptr) error { return vtabBlobClose(tls, h) },
+	}
+
+	return vtab.NewContextWithBlob(
+		func(schema string) error {
+			zSchema, err := libc.CString(schema)
+			if err != nil {
+				return err
+			}
+			defer libc.Xfree(tls, zSchema)
+			if rc := sqlite3.Xsqlite3_declare_vtab(tls, db, zSchema); rc != sqlite3.SQLITE_OK {
+				return fmt.Errorf("declare_vtab failed: rc=%d", rc)
+			}
+			return nil
+		},
+		func() error {
+			return vtabConfig(tls, db, sqlite3.SQLITE_VTAB_CONSTRAINT_SUPPORT, 1)
+		},
+		func(op int32, args ...int32) error {
+			return vtabConfig(tls, db, op, args...)
+		},
+		execSQL,
+		blobOps,
+	)
+}
+
 // vtabCreateTrampoline is the xCreate callback. It invokes the corresponding
 // Go vtab.Module.Create method, declares a default schema based on argv, and
 // allocates a sqlite3_vtab.
@@ -197,21 +239,7 @@ func vtabCreateTrampoline(tls *libc.TLS, db uintptr, pAux uintptr, argc int32, a
 		return sqlite3.SQLITE_ERROR
 	}
 	args := extractVtabArgs(tls, argc, argv)
-	ctx := vtab.NewContextWithConfig(func(schema string) error {
-		zSchema, err := libc.CString(schema)
-		if err != nil {
-			return err
-		}
-		defer libc.Xfree(tls, zSchema)
-		if rc := sqlite3.Xsqlite3_declare_vtab(tls, db, zSchema); rc != sqlite3.SQLITE_OK {
-			return fmt.Errorf("declare_vtab failed: rc=%d", rc)
-		}
-		return nil
-	}, func() error {
-		return vtabConfig(tls, db, sqlite3.SQLITE_VTAB_CONSTRAINT_SUPPORT, 1)
-	}, func(op int32, args ...int32) error {
-		return vtabConfig(tls, db, op, args...)
-	})
+	ctx := vtabNewContext(tls, db)
 	tbl, err := gm.impl.Create(ctx, args)
 	if err != nil {
 		setVtabError(tls, pzErr, err.Error())
@@ -229,7 +257,8 @@ func vtabCreateTrampoline(tls *libc.TLS, db uintptr, pAux uintptr, argc int32, a
 	}
 	*(*uintptr)(unsafe.Pointer(ppVtab)) = p
 
-	gt := &goTable{mod: gm, impl: tbl}
+	gt := &goTable{mod: gm, impl: tbl, db: db}
+
 	vtabTables.mu.Lock()
 	vtabTables.m[p] = gt
 	vtabTables.mu.Unlock()
@@ -245,21 +274,7 @@ func vtabConnectTrampoline(tls *libc.TLS, db uintptr, pAux uintptr, argc int32, 
 		return sqlite3.SQLITE_ERROR
 	}
 	args := extractVtabArgs(tls, argc, argv)
-	ctx := vtab.NewContextWithConfig(func(schema string) error {
-		zSchema, err := libc.CString(schema)
-		if err != nil {
-			return err
-		}
-		defer libc.Xfree(tls, zSchema)
-		if rc := sqlite3.Xsqlite3_declare_vtab(tls, db, zSchema); rc != sqlite3.SQLITE_OK {
-			return fmt.Errorf("declare_vtab failed: rc=%d", rc)
-		}
-		return nil
-	}, func() error {
-		return vtabConfig(tls, db, sqlite3.SQLITE_VTAB_CONSTRAINT_SUPPORT, 1)
-	}, func(op int32, args ...int32) error {
-		return vtabConfig(tls, db, op, args...)
-	})
+	ctx := vtabNewContext(tls, db)
 	tbl, err := gm.impl.Connect(ctx, args)
 	if err != nil {
 		setVtabError(tls, pzErr, err.Error())
@@ -277,7 +292,8 @@ func vtabConnectTrampoline(tls *libc.TLS, db uintptr, pAux uintptr, argc int32, 
 	}
 	*(*uintptr)(unsafe.Pointer(ppVtab)) = p
 
-	gt := &goTable{mod: gm, impl: tbl}
+	gt := &goTable{mod: gm, impl: tbl, db: db}
+
 	vtabTables.mu.Lock()
 	vtabTables.m[p] = gt
 	vtabTables.mu.Unlock()
@@ -349,6 +365,7 @@ func vtabBestIndexTrampoline(tls *libc.TLS, pVtab uintptr, pInfo uintptr) int32 
 				Usable:   c.Fusable != 0,
 				ArgIndex: -1, // 0-based; -1 means ignore
 				Omit:     false,
+				IsIn:     sqlite3.Xsqlite3_vtab_in(tls, pInfo, int32(i), -1) != 0,
 			})
 		}
 		info.Constraints = cs
@@ -377,6 +394,17 @@ func vtabBestIndexTrampoline(tls *libc.TLS, pVtab uintptr, pInfo uintptr) int32 
 	if idx.FidxFlags != 0 {
 		info.IdxFlags = int(idx.FidxFlags)
 	}
+
+	// Add IN constraint handling callbacks
+	info.SetIsInFunc(func(iCons int) bool {
+		if iCons < 0 || iCons >= int(idx.FnConstraint) {
+			return false
+		}
+		return sqlite3.Xsqlite3_vtab_in(tls, pInfo, int32(iCons), -1) != 0
+	})
+	info.SetHandleInFunc(func(iCons int, handle int) {
+		sqlite3.Xsqlite3_vtab_in(tls, pInfo, int32(iCons), int32(handle))
+	})
 
 	if err := gt.impl.BestIndex(info); err != nil {
 		// Report error via zErrMsg on pVtab.
@@ -530,6 +558,49 @@ func vtabFilterTrampoline(tls *libc.TLS, pCursor uintptr, idxNum int32, idxStr u
 		idxStrGo = libc.GoString(idxStr)
 	}
 	vals := functionArgs(tls, argc, argv)
+
+	// Check for CursorWithContext (preferred for IN constraint support)
+	if curCtx, ok := gc.impl.(vtab.CursorWithContext); ok {
+		// Collect raw sqlite3_value pointers for IN iteration
+		valPtrs := make([]uintptr, argc)
+		for i := int32(0); i < argc; i++ {
+			valPtrs[i] = *(*uintptr)(unsafe.Pointer(argv + uintptr(i)*sqliteValPtrSize))
+		}
+
+		// Create context with IN iteration support
+		ctx := vtab.NewContextForFilter(vtab.Context{}, &vtab.FilterContextConfig{
+			ValPtrs: valPtrs,
+			InFirst: func(valPtr uintptr) (driver.Value, bool) {
+				var ppOut uintptr
+				rc := sqlite3.Xsqlite3_vtab_in_first(tls, valPtr, uintptr(unsafe.Pointer(&ppOut)))
+				if rc != sqlite3.SQLITE_OK || ppOut == 0 {
+					return nil, false
+				}
+				return sqliteValueToGo(tls, ppOut), true
+			},
+			InNext: func(valPtr uintptr) (driver.Value, bool) {
+				var ppOut uintptr
+				rc := sqlite3.Xsqlite3_vtab_in_next(tls, valPtr, uintptr(unsafe.Pointer(&ppOut)))
+				if rc != sqlite3.SQLITE_OK || ppOut == 0 {
+					return nil, false
+				}
+				return sqliteValueToGo(tls, ppOut), true
+			},
+		})
+
+		if err := curCtx.FilterWithContext(ctx, int(idxNum), idxStrGo, vals); err != nil {
+			if pCursor != 0 {
+				cur := (*sqlite3.Sqlite3_vtab_cursor)(unsafe.Pointer(pCursor))
+				if cur.FpVtab != 0 {
+					setVtabZErrMsg(tls, cur.FpVtab, err.Error())
+				}
+			}
+			return sqlite3.SQLITE_ERROR
+		}
+		return sqlite3.SQLITE_OK
+	}
+
+	// Fallback to standard Cursor interface
 	if err := gc.impl.Filter(int(idxNum), idxStrGo, vals); err != nil {
 		// Set zErrMsg on the associated vtab for better diagnostics.
 		if pCursor != 0 {
@@ -541,6 +612,30 @@ func vtabFilterTrampoline(tls *libc.TLS, pCursor uintptr, idxNum int32, idxStr u
 		return sqlite3.SQLITE_ERROR
 	}
 	return sqlite3.SQLITE_OK
+}
+
+// sqliteValueToGo converts a sqlite3_value pointer to a Go driver.Value.
+func sqliteValueToGo(tls *libc.TLS, valPtr uintptr) driver.Value {
+	switch valType := sqlite3.Xsqlite3_value_type(tls, valPtr); valType {
+	case sqlite3.SQLITE_TEXT:
+		return libc.GoString(sqlite3.Xsqlite3_value_text(tls, valPtr))
+	case sqlite3.SQLITE_INTEGER:
+		return sqlite3.Xsqlite3_value_int64(tls, valPtr)
+	case sqlite3.SQLITE_FLOAT:
+		return sqlite3.Xsqlite3_value_double(tls, valPtr)
+	case sqlite3.SQLITE_NULL:
+		return nil
+	case sqlite3.SQLITE_BLOB:
+		size := sqlite3.Xsqlite3_value_bytes(tls, valPtr)
+		blobPtr := sqlite3.Xsqlite3_value_blob(tls, valPtr)
+		v := make([]byte, size)
+		if size != 0 {
+			copy(v, (*libc.RawMem)(unsafe.Pointer(blobPtr))[:size:size])
+		}
+		return v
+	default:
+		return nil
+	}
 }
 
 // vtabNextTrampoline is xNext.
@@ -642,6 +737,194 @@ func extractVtabArgs(tls *libc.TLS, argc int32, argv uintptr) []string {
 	return args
 }
 
+// vtabExecDirect executes SQL directly using the SQLite C API, avoiding
+// the database/sql layer which would cause deadlocks in vtab callbacks.
+// This is used by the vtab Context.Exec method to allow shadow table creation
+// during Create/Connect callbacks.
+func vtabExecDirect(tls *libc.TLS, db uintptr, sql string, args []driver.Value) error {
+	// For simple DDL without parameters, use sqlite3_exec directly
+	if len(args) == 0 {
+		zSql, err := libc.CString(sql)
+		if err != nil {
+			return err
+		}
+		defer libc.Xfree(tls, zSql)
+
+		rc := sqlite3.Xsqlite3_exec(tls, db, zSql, 0, 0, 0)
+		if rc != sqlite3.SQLITE_OK {
+			return fmt.Errorf("exec failed: %d", rc)
+		}
+		// Coverage: this path is tested by TestTransactionContextExecWithoutParams
+		return nil
+	}
+	// Coverage: this path is tested by TestTransactionContextExec with params
+
+	// For statements with parameters, use prepare/step/finalize
+	zSql, err := libc.CString(sql)
+	if err != nil {
+		return err
+	}
+	defer libc.Xfree(tls, zSql)
+
+	var stmt uintptr
+	rc := sqlite3.Xsqlite3_prepare_v2(tls, db, zSql, -1, uintptr(unsafe.Pointer(&stmt)), 0)
+	if rc != sqlite3.SQLITE_OK {
+		return fmt.Errorf("prepare failed: %d", rc)
+	}
+	if stmt == 0 {
+		return fmt.Errorf("prepare returned nil statement")
+	}
+	defer sqlite3.Xsqlite3_finalize(tls, stmt)
+
+	// Bind parameters
+	for i, arg := range args {
+		if err := vtabBindValue(tls, stmt, int32(i+1), arg); err != nil {
+			return fmt.Errorf("bind param %d failed: %w", i+1, err)
+		}
+	}
+
+	// Execute
+	for {
+		rc := sqlite3.Xsqlite3_step(tls, stmt)
+		if rc == sqlite3.SQLITE_DONE {
+			break
+		}
+		if rc == sqlite3.SQLITE_ROW {
+			continue // fetch next row if any
+		}
+		return fmt.Errorf("step failed: %d", rc)
+	}
+
+	return nil
+}
+
+// vtabBindValue binds a driver.Value to a prepared statement parameter.
+func vtabBindValue(tls *libc.TLS, stmt uintptr, idx int32, val driver.Value) error {
+	switch v := val.(type) {
+	case nil:
+		sqlite3.Xsqlite3_bind_null(tls, stmt, idx)
+	case int:
+		sqlite3.Xsqlite3_bind_int64(tls, stmt, idx, sqlite3.Sqlite3_int64(v))
+	case int32:
+		sqlite3.Xsqlite3_bind_int(tls, stmt, idx, v)
+	case int64:
+		sqlite3.Xsqlite3_bind_int64(tls, stmt, idx, sqlite3.Sqlite3_int64(v))
+	case float64:
+		sqlite3.Xsqlite3_bind_double(tls, stmt, idx, v)
+	case string:
+		z, err := libc.CString(v)
+		if err != nil {
+			return err
+		}
+		// SQLite makes its own copy with SQLITE_STATIC, so we free after binding
+		sqlite3.Xsqlite3_bind_text(tls, stmt, idx, z, int32(len(v)), sqlite3.SQLITE_TRANSIENT)
+		libc.Xfree(tls, z)
+	case []byte:
+		if v == nil {
+			sqlite3.Xsqlite3_bind_null(tls, stmt, idx)
+		} else {
+			// Make a copy since SQLite might retain the pointer
+			p := sqlite3.Xsqlite3_malloc(tls, int32(len(v)))
+			if p == 0 {
+				return fmt.Errorf("out of memory")
+			}
+			copy((*libc.RawMem)(unsafe.Pointer(p))[:len(v):len(v)], v)
+			sqlite3.Xsqlite3_bind_blob(tls, stmt, idx, p, int32(len(v)), sqlite3.SQLITE_TRANSIENT)
+		}
+	case bool:
+		if v {
+			sqlite3.Xsqlite3_bind_int(tls, stmt, idx, 1)
+		} else {
+			sqlite3.Xsqlite3_bind_int(tls, stmt, idx, 0)
+		}
+	case time.Time:
+		// Store as ISO 8601 string
+		s := v.Format(time.RFC3339Nano)
+		z, err := libc.CString(s)
+		if err != nil {
+			return err
+		}
+		sqlite3.Xsqlite3_bind_text(tls, stmt, idx, z, int32(len(s)), sqlite3.SQLITE_TRANSIENT)
+		libc.Xfree(tls, z)
+	default:
+		return fmt.Errorf("unsupported type: %T", val)
+	}
+	return nil
+}
+
+// vtabBlobOpen opens a BLOB for direct read/write access.
+// This wraps sqlite3_blob_open for efficient binary I/O.
+func vtabBlobOpen(tls *libc.TLS, dbHandle uintptr, dbName, table, column string, rowid int64, write bool) (*vtab.Blob, error) {
+	zDb, err := libc.CString(dbName)
+	if err != nil {
+		return nil, err
+	}
+	defer libc.Xfree(tls, zDb)
+
+	zTable, err := libc.CString(table)
+	if err != nil {
+		return nil, err
+	}
+	defer libc.Xfree(tls, zTable)
+
+	zColumn, err := libc.CString(column)
+	if err != nil {
+		return nil, err
+	}
+	defer libc.Xfree(tls, zColumn)
+
+	var flags int32 = 0 // read-only
+	if write {
+		flags = 1
+	}
+
+	var blobHandle uintptr
+	rc := sqlite3.Xsqlite3_blob_open(tls, dbHandle, zDb, zTable, zColumn, sqlite3.Sqlite3_int64(rowid), flags, uintptr(unsafe.Pointer(&blobHandle)))
+	if rc != sqlite3.SQLITE_OK {
+		return nil, fmt.Errorf("sqlite3_blob_open failed: rc=%d", rc)
+	}
+
+	return vtab.NewBlob(
+		blobHandle,
+		func(h uintptr, off int64, p []byte) error { return vtabBlobRead(tls, h, off, p) },
+		func(h uintptr, off int64, p []byte) error { return vtabBlobWrite(tls, h, off, p) },
+		func(h uintptr) error { return vtabBlobClose(tls, h) },
+	), nil
+}
+
+// vtabBlobRead reads data from an open BLOB handle.
+func vtabBlobRead(tls *libc.TLS, blobHandle uintptr, offset int64, p []byte) error {
+	if len(p) == 0 {
+		return nil
+	}
+	rc := sqlite3.Xsqlite3_blob_read(tls, blobHandle, uintptr(unsafe.Pointer(&p[0])), int32(len(p)), int32(offset))
+	if rc != sqlite3.SQLITE_OK {
+		return fmt.Errorf("sqlite3_blob_read failed: rc=%d", rc)
+	}
+	return nil
+}
+
+// vtabBlobWrite writes data to an open BLOB handle.
+func vtabBlobWrite(tls *libc.TLS, blobHandle uintptr, offset int64, p []byte) error {
+	if len(p) == 0 {
+		return nil
+	}
+	rc := sqlite3.Xsqlite3_blob_write(tls, blobHandle, uintptr(unsafe.Pointer(&p[0])), int32(len(p)), int32(offset))
+	if rc != sqlite3.SQLITE_OK {
+		return fmt.Errorf("sqlite3_blob_write failed: rc=%d", rc)
+	}
+	return nil
+}
+
+// vtabBlobClose closes a BLOB handle.
+func vtabBlobClose(tls *libc.TLS, blobHandle uintptr) error {
+	rc := sqlite3.Xsqlite3_blob_close(tls, blobHandle)
+	if rc != sqlite3.SQLITE_OK {
+		return fmt.Errorf("sqlite3_blob_close failed: rc=%d", rc)
+	}
+	return nil
+}
+
 func setVtabError(tls *libc.TLS, pzErr uintptr, msg string) {
 	if pzErr == 0 {
 		return
@@ -707,7 +990,7 @@ func vtabRenameTrampoline(tls *libc.TLS, pVtab uintptr, zNew uintptr) int32 {
 	return sqlite3.SQLITE_OK
 }
 
-// vtabUpdateTrampoline is xUpdate. Not supported by default; report read-only.
+// vtabUpdateTrampoline is xUpdate. Supports both Updater and UpdaterWithContext.
 func vtabUpdateTrampoline(tls *libc.TLS, pVtab uintptr, argc int32, argv uintptr, pRowid uintptr) int32 {
 	vtabTables.mu.RLock()
 	gt := vtabTables.m[pVtab]
@@ -715,6 +998,89 @@ func vtabUpdateTrampoline(tls *libc.TLS, pVtab uintptr, argc int32, argv uintptr
 	if gt == nil {
 		return sqlite3.SQLITE_ERROR
 	}
+
+	// Check for UpdaterWithContext first (preferred for full functionality)
+	if updCtx, ok := gt.impl.(vtab.UpdaterWithContext); ok {
+		ctx := vtabNewContext(tls, gt.db)
+
+		// DELETE: argc == 1; argv[0]=oldRowid
+		if argc == 1 {
+			valPtr := *(*uintptr)(unsafe.Pointer(argv))
+			oldRowid := int64(0)
+			if sqlite3.Xsqlite3_value_type(tls, valPtr) != sqlite3.SQLITE_NULL {
+				oldRowid = int64(sqlite3.Xsqlite3_value_int64(tls, valPtr))
+			}
+			if err := updCtx.Delete(ctx, oldRowid); err != nil {
+				setVtabZErrMsg(tls, pVtab, err.Error())
+				return sqlite3.SQLITE_ERROR
+			}
+			return sqlite3.SQLITE_OK
+		}
+
+		// INSERT or UPDATE
+		if argc < 3 {
+			return sqlite3.SQLITE_MISUSE
+		}
+		nCols := argc - 2
+		colsPtr := argv + uintptr(1)*sqliteValPtrSize
+		cols := functionArgs(tls, nCols, colsPtr)
+
+		oldPtr := *(*uintptr)(unsafe.Pointer(argv + uintptr(0)*sqliteValPtrSize))
+		newPtr := *(*uintptr)(unsafe.Pointer(argv + uintptr(argc-1)*sqliteValPtrSize))
+
+		oldIsNull := sqlite3.Xsqlite3_value_type(tls, oldPtr) == sqlite3.SQLITE_NULL
+		newIsNull := sqlite3.Xsqlite3_value_type(tls, newPtr) == sqlite3.SQLITE_NULL
+
+		if oldIsNull {
+			// INSERT - no nochange check needed
+			var rid int64
+			if !newIsNull {
+				rid = int64(sqlite3.Xsqlite3_value_int64(tls, newPtr))
+			}
+			if err := updCtx.Insert(ctx, cols, &rid); err != nil {
+				setVtabZErrMsg(tls, pVtab, err.Error())
+				return sqlite3.SQLITE_ERROR
+			}
+			if pRowid != 0 {
+				*(*int64)(unsafe.Pointer(pRowid)) = rid
+			}
+			return sqlite3.SQLITE_OK
+		}
+
+		// UPDATE - add nochange detection support
+		oldRowid := int64(sqlite3.Xsqlite3_value_int64(tls, oldPtr))
+		var newRid int64
+		if !newIsNull {
+			newRid = int64(sqlite3.Xsqlite3_value_int64(tls, newPtr))
+		}
+
+		// Collect column pointers for nochange detection
+		colPtrs := make([]uintptr, nCols)
+		for i := int32(0); i < nCols; i++ {
+			colPtrs[i] = *(*uintptr)(unsafe.Pointer(colsPtr + uintptr(i)*sqliteValPtrSize))
+		}
+
+		// Create context with nochange support
+		ctx = vtab.NewContextForUpdate(ctx, &vtab.UpdateContextConfig{
+			NoChangeCheck: func(colIndex int) bool {
+				if colIndex < 0 || colIndex >= len(colPtrs) {
+					return false
+				}
+				return sqlite3.Xsqlite3_value_nochange(tls, colPtrs[colIndex]) != 0
+			},
+		})
+
+		if err := updCtx.Update(ctx, oldRowid, cols, &newRid); err != nil {
+			setVtabZErrMsg(tls, pVtab, err.Error())
+			return sqlite3.SQLITE_ERROR
+		}
+		if pRowid != 0 && newRid != 0 {
+			*(*int64)(unsafe.Pointer(pRowid)) = newRid
+		}
+		return sqlite3.SQLITE_OK
+	}
+
+	// Fallback to Updater (legacy interface without Context)
 	upd, ok := gt.impl.(interface {
 		Insert(cols []vtab.Value, rowid *int64) error
 		Update(oldRowid int64, cols []vtab.Value, newRowid *int64) error
@@ -795,6 +1161,18 @@ func vtabBeginTrampoline(tls *libc.TLS, pVtab uintptr) int32 {
 	if gt == nil {
 		return sqlite3.SQLITE_ERROR
 	}
+
+	// Check for TransactionalWithContext first (preferred)
+	if tr, ok := gt.impl.(vtab.TransactionalWithContext); ok {
+		ctx := vtabNewContext(tls, gt.db)
+		if err := tr.Begin(ctx); err != nil {
+			setVtabZErrMsg(tls, pVtab, err.Error())
+			return sqlite3.SQLITE_ERROR
+		}
+		return sqlite3.SQLITE_OK
+	}
+
+	// Fallback to Transactional (legacy interface)
 	if tr, ok := gt.impl.(interface{ Begin() error }); ok {
 		if err := tr.Begin(); err != nil {
 			setVtabZErrMsg(tls, pVtab, err.Error())
@@ -811,6 +1189,18 @@ func vtabSyncTrampoline(tls *libc.TLS, pVtab uintptr) int32 {
 	if gt == nil {
 		return sqlite3.SQLITE_ERROR
 	}
+
+	// Check for TransactionalWithContext first (preferred)
+	if tr, ok := gt.impl.(vtab.TransactionalWithContext); ok {
+		ctx := vtabNewContext(tls, gt.db)
+		if err := tr.Sync(ctx); err != nil {
+			setVtabZErrMsg(tls, pVtab, err.Error())
+			return sqlite3.SQLITE_ERROR
+		}
+		return sqlite3.SQLITE_OK
+	}
+
+	// Fallback to Transactional (legacy interface)
 	if tr, ok := gt.impl.(interface{ Sync() error }); ok {
 		if err := tr.Sync(); err != nil {
 			setVtabZErrMsg(tls, pVtab, err.Error())
@@ -827,6 +1217,18 @@ func vtabCommitTrampoline(tls *libc.TLS, pVtab uintptr) int32 {
 	if gt == nil {
 		return sqlite3.SQLITE_ERROR
 	}
+
+	// Check for TransactionalWithContext first (preferred)
+	if tr, ok := gt.impl.(vtab.TransactionalWithContext); ok {
+		ctx := vtabNewContext(tls, gt.db)
+		if err := tr.Commit(ctx); err != nil {
+			setVtabZErrMsg(tls, pVtab, err.Error())
+			return sqlite3.SQLITE_ERROR
+		}
+		return sqlite3.SQLITE_OK
+	}
+
+	// Fallback to Transactional (legacy interface)
 	if tr, ok := gt.impl.(interface{ Commit() error }); ok {
 		if err := tr.Commit(); err != nil {
 			setVtabZErrMsg(tls, pVtab, err.Error())
@@ -843,6 +1245,18 @@ func vtabRollbackTrampoline(tls *libc.TLS, pVtab uintptr) int32 {
 	if gt == nil {
 		return sqlite3.SQLITE_ERROR
 	}
+
+	// Check for TransactionalWithContext first (preferred)
+	if tr, ok := gt.impl.(vtab.TransactionalWithContext); ok {
+		ctx := vtabNewContext(tls, gt.db)
+		if err := tr.Rollback(ctx); err != nil {
+			setVtabZErrMsg(tls, pVtab, err.Error())
+			return sqlite3.SQLITE_ERROR
+		}
+		return sqlite3.SQLITE_OK
+	}
+
+	// Fallback to Transactional (legacy interface)
 	if tr, ok := gt.impl.(interface{ Rollback() error }); ok {
 		if err := tr.Rollback(); err != nil {
 			setVtabZErrMsg(tls, pVtab, err.Error())
@@ -859,6 +1273,18 @@ func vtabSavepointTrampoline(tls *libc.TLS, pVtab uintptr, i int32) int32 {
 	if gt == nil {
 		return sqlite3.SQLITE_ERROR
 	}
+
+	// Check for TransactionalWithContext first (preferred)
+	if tr, ok := gt.impl.(vtab.TransactionalWithContext); ok {
+		ctx := vtabNewContext(tls, gt.db)
+		if err := tr.Savepoint(ctx, int(i)); err != nil {
+			setVtabZErrMsg(tls, pVtab, err.Error())
+			return sqlite3.SQLITE_ERROR
+		}
+		return sqlite3.SQLITE_OK
+	}
+
+	// Fallback to Transactional (legacy interface)
 	if tr, ok := gt.impl.(interface{ Savepoint(int) error }); ok {
 		if err := tr.Savepoint(int(i)); err != nil {
 			setVtabZErrMsg(tls, pVtab, err.Error())
@@ -875,6 +1301,18 @@ func vtabReleaseTrampoline(tls *libc.TLS, pVtab uintptr, i int32) int32 {
 	if gt == nil {
 		return sqlite3.SQLITE_ERROR
 	}
+
+	// Check for TransactionalWithContext first (preferred)
+	if tr, ok := gt.impl.(vtab.TransactionalWithContext); ok {
+		ctx := vtabNewContext(tls, gt.db)
+		if err := tr.Release(ctx, int(i)); err != nil {
+			setVtabZErrMsg(tls, pVtab, err.Error())
+			return sqlite3.SQLITE_ERROR
+		}
+		return sqlite3.SQLITE_OK
+	}
+
+	// Fallback to Transactional (legacy interface)
 	if tr, ok := gt.impl.(interface{ Release(int) error }); ok {
 		if err := tr.Release(int(i)); err != nil {
 			setVtabZErrMsg(tls, pVtab, err.Error())
@@ -891,6 +1329,18 @@ func vtabRollbackToTrampoline(tls *libc.TLS, pVtab uintptr, i int32) int32 {
 	if gt == nil {
 		return sqlite3.SQLITE_ERROR
 	}
+
+	// Check for TransactionalWithContext first (preferred)
+	if tr, ok := gt.impl.(vtab.TransactionalWithContext); ok {
+		ctx := vtabNewContext(tls, gt.db)
+		if err := tr.RollbackTo(ctx, int(i)); err != nil {
+			setVtabZErrMsg(tls, pVtab, err.Error())
+			return sqlite3.SQLITE_ERROR
+		}
+		return sqlite3.SQLITE_OK
+	}
+
+	// Fallback to Transactional (legacy interface)
 	if tr, ok := gt.impl.(interface{ RollbackTo(int) error }); ok {
 		if err := tr.RollbackTo(int(i)); err != nil {
 			setVtabZErrMsg(tls, pVtab, err.Error())

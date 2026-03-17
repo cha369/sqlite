@@ -57,3 +57,213 @@ package vtab
 //   inside the engine and issuing re-entrant SQL on the same connection can
 //   lead to deadlocks or undefined behavior. If a module requires issuing SQL,
 //   consider using a separate connection and document the concurrency model.
+//
+// Complete Example
+//
+// This example demonstrates how to implement a simple key-value virtual table:
+//
+//	package main
+//
+//	import (
+//		"database/sql"
+//		"fmt"
+//		"sync"
+//
+//		"modernc.org/sqlite"
+//		_ "modernc.org/sqlite"
+//		"modernc.org/sqlite/vtab"
+//	)
+//
+//	// KVModule implements vtab.Module for a simple key-value table
+//	type KVModule struct {
+//		mu     sync.RWMutex
+//		tables map[string]*KVTable
+//	}
+//
+//	func NewKVModule() *KVModule {
+//		return &KVModule{tables: make(map[string]*KVTable)}
+//	}
+//
+//	func (m *KVModule) Create(ctx vtab.Context, args []string) (vtab.Table, error) {
+//		// args[0] = module name, args[1] = db name, args[2] = table name, args[3...] = module args
+//		tableName := args[2]
+//		return m.connect(ctx, tableName)
+//	}
+//
+//	func (m *KVModule) Connect(ctx vtab.Context, args []string) (vtab.Table, error) {
+//		tableName := args[2]
+//		return m.connect(ctx, tableName)
+//	}
+//
+//	func (m *KVModule) connect(ctx vtab.Context, name string) (vtab.Table, error) {
+//		// Declare the virtual table schema
+//		if err := ctx.Declare("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)"); err != nil {
+//			return nil, err
+//		}
+//
+//		table := &KVTable{name: name, data: make(map[string]string)}
+//		m.mu.Lock()
+//		m.tables[name] = table
+//		m.mu.Unlock()
+//		return table, nil
+//	}
+//
+//	// KVTable implements vtab.Table with read/write support
+//	type KVTable struct {
+//		name string
+//		mu   sync.RWMutex
+//		data map[string]string
+//	}
+//
+//	func (t *KVTable) BestIndex(info *vtab.IndexInfo) error {
+//		// For simplicity, always use full scan
+//		info.EstimatedCost = 1000000
+//		info.OrderByConsumed = false
+//		return nil
+//	}
+//
+//	func (t *KVTable) Open() (vtab.Cursor, error) {
+//		return &KVCursor{table: t}, nil
+//	}
+//
+//	func (t *KVTable) Disconnect() error { return nil }
+//	func (t *KVTable) Destroy() error    { return nil }
+//
+//	// Implement UpdaterWithContext for write support
+//	func (t *KVTable) InsertWithContext(ctx vtab.Context, cols []vtab.Value, rowid *int64) error {
+//		if len(cols) < 2 {
+//			return fmt.Errorf("insert requires key and value")
+//		}
+//		key, _ := cols[0].(string)
+//		value, _ := cols[1].(string)
+//		t.mu.Lock()
+//		t.data[key] = value
+//		t.mu.Unlock()
+//		return nil
+//	}
+//
+//	func (t *KVTable) UpdateWithContext(ctx vtab.Context, oldRowid int64, cols []vtab.Value, newRowid *int64) error {
+//		if len(cols) < 2 {
+//			return fmt.Errorf("update requires key and value")
+//		}
+//		key, _ := cols[0].(string)
+//		value, _ := cols[1].(string)
+//		t.mu.Lock()
+//		t.data[key] = value
+//		t.mu.Unlock()
+//		return nil
+//	}
+//
+//	func (t *KVTable) DeleteWithContext(ctx vtab.Context, rowid int64) error {
+//		return nil
+//	}
+//
+//	// KVCursor implements vtab.Cursor for scanning
+//	type KVCursor struct {
+//		table *KVTable
+//		keys  []string
+//		idx   int
+//	}
+//
+//	func (c *KVCursor) Filter(idxNum int, idxStr string, vals []vtab.Value) error {
+//		c.table.mu.RLock()
+//		defer c.table.mu.RUnlock()
+//		c.keys = make([]string, 0, len(c.table.data))
+//		for k := range c.table.data {
+//			c.keys = append(c.keys, k)
+//		}
+//		c.idx = 0
+//		return nil
+//	}
+//
+//	func (c *KVCursor) Next() error {
+//		if c.idx < len(c.keys) {
+//			c.idx++
+//		}
+//		return nil
+//	}
+//
+//	func (c *KVCursor) Eof() bool {
+//		return c.idx >= len(c.keys)
+//	}
+//
+//	func (c *KVCursor) Column(col int) (vtab.Value, error) {
+//		if c.idx >= len(c.keys) {
+//			return nil, nil
+//		}
+//		key := c.keys[c.idx]
+//		c.table.mu.RLock()
+//		value := c.table.data[key]
+//		c.table.mu.RUnlock()
+//		if col == 0 {
+//			return key, nil
+//		}
+//		return value, nil
+//	}
+//
+//	func (c *KVCursor) Rowid() (int64, error) {
+//		return int64(c.idx + 1), nil
+//	}
+//
+//	func (c *KVCursor) Close() error { return nil }
+//
+//	func main() {
+//		sql.Register("kvdriver", &sqlite.Driver{})
+//		db, _ := sql.Open("kvdriver", ":memory:")
+//		defer db.Close()
+//
+//		module := NewKVModule()
+//		if err := vtab.RegisterModule(db, "kv", module); err != nil {
+//			panic(err)
+//		}
+//
+//		db.Exec("CREATE VIRTUAL TABLE mydata USING kv()")
+//		db.Exec("INSERT INTO mydata VALUES (?, ?)", "name", "test")
+//
+//		rows, _ := db.Query("SELECT * FROM mydata")
+//		for rows.Next() {
+//			var k, v string
+//			rows.Scan(&k, &v)
+//			fmt.Println(k, v)
+//		}
+//	}
+//
+// Best Practices
+//
+// 1. Shadow Tables for Persistence
+//
+// Virtual tables should use shadow tables for data persistence. Create shadow
+// tables before CREATE VIRTUAL TABLE, then use ctx.Exec() or ctx.OpenBlob()
+// within transaction callbacks to sync data.
+//
+// 2. Thread Safety
+//
+//   - Use sync.RWMutex for read-heavy workloads
+//   - Consider connection pooling for concurrent access
+//   - Be aware that vtab callbacks may be called concurrently from multiple
+//     goroutines when using WAL mode with busy_timeout.
+//
+// 3. Memory Management
+//
+//   - Release resources in Cursor.Close()
+//   - Clear large caches in Table.Destroy()
+//   - Use value pooling for high-frequency allocations
+//
+// 4. Error Handling
+//
+//   - Always return descriptive errors from vtab methods
+//   - Use setVtabZErrMsg to set error messages for SQLite
+//   - Propagate errors from ctx.Exec() and ctx.OpenBlob()
+//
+// 5. BestIndex Optimization
+//
+//   - Set EstimatedCost accurately based on row count
+//   - Use Constraint.Omit for fully handled constraints
+//   - Set IdxFlags = IndexScanUnique for point queries
+//   - Leverage idxStr to encode complex query plans
+//
+// 6. Transaction Coordination
+//
+//   - Implement TransactionalWithContext for ACID guarantees
+//   - Use pending operations queue, commit in Sync/Commit
+//   - Implement Rollback to discard pending changes

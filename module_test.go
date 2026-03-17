@@ -1002,49 +1002,55 @@ func TestVtabUpdaterInsertUpdateDelete(t *testing.T) {
 		t.Fatalf("insert carol: %v", err)
 	}
 
-	// Verify rows
-	assertRows := func(want []int64) {
-		rows, err := db.Query(`SELECT rowid FROM ut ORDER BY rowid`)
+	// Verify rows with both rowid and column value
+	assertRows := func(wantIDs []int64, wantVals []string) {
+		rows, err := db.Query(`SELECT rowid, val FROM ut ORDER BY rowid`)
 		if err != nil {
 			t.Fatalf("select: %v", err)
 		}
 		defer rows.Close()
-		got := make([]int64, 0)
+		gotIDs := make([]int64, 0)
+		gotVals := make([]string, 0)
 		for rows.Next() {
 			var id int64
-			if err := rows.Scan(&id); err != nil {
+			var val string
+			if err := rows.Scan(&id, &val); err != nil {
 				t.Fatalf("scan: %v", err)
 			}
-			got = append(got, id)
+			gotIDs = append(gotIDs, id)
+			gotVals = append(gotVals, val)
 		}
 		if err := rows.Err(); err != nil {
 			t.Fatalf("rows.Err: %v", err)
 		}
-		if len(got) != len(want) {
-			t.Fatalf("got %d rows, want %d: %v", len(got), len(want), got)
+		if len(gotIDs) != len(wantIDs) {
+			t.Fatalf("got %d rows, want %d: IDs=%v", len(gotIDs), len(wantIDs), gotIDs)
 		}
-		for i := range want {
-			if got[i] != want[i] {
-				t.Fatalf("ids mismatch got %v want %v", got, want)
+		for i := range wantIDs {
+			if gotIDs[i] != wantIDs[i] {
+				t.Fatalf("rowid mismatch: got %v want %v", gotIDs, wantIDs)
+			}
+			if gotVals[i] != wantVals[i] {
+				t.Fatalf("val mismatch at row %d: got %q want %q", gotIDs[i], gotVals[i], wantVals[i])
 			}
 		}
 	}
 
-	assertRows([]int64{1, 2, 3})
+	assertRows([]int64{1, 2, 3}, []string{"Alice", "Bob", "Carol"})
 
 	// Update Bob's email (rowid=2)
 	if _, err := db.Exec(`UPDATE ut SET val = ? WHERE rowid = ?`, "Bobby", 2); err != nil {
 		t.Fatalf("update: %v", err)
 	}
 	// Rowids remain unchanged after value update
-	assertRows([]int64{1, 2, 3})
+	assertRows([]int64{1, 2, 3}, []string{"Alice", "Bobby", "Carol"})
 
 	// Delete Bob (rowid=2)
 	if _, err := db.Exec(`DELETE FROM ut WHERE rowid = ?`, 2); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 
-	assertRows([]int64{1, 3})
+	assertRows([]int64{1, 3}, []string{"Alice", "Carol"})
 }
 
 // --- TransactionContext.Exec Tests ---

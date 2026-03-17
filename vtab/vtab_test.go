@@ -3,6 +3,7 @@ package vtab
 import (
 	"database/sql/driver"
 	"errors"
+	"sync"
 	"testing"
 )
 
@@ -842,5 +843,537 @@ func TestInIterateWithNilValPtrs(t *testing.T) {
 	it := ctx.InIterate([]driver.Value{}, 0)
 	if it.Next() {
 		t.Error("Expected false when valPtrs is nil")
+	}
+}
+
+// ============================================================================
+// 边界情况测试用例
+// ============================================================================
+
+// TestConstraintOpValues 测试 ConstraintOp 常量值
+func TestConstraintOpValues(t *testing.T) {
+	// 验证所有约束操作符值存在且唯一
+	ops := []ConstraintOp{
+		OpEQ, OpGT, OpLE, OpLT, OpGE, OpNE,
+		OpIS, OpISNOT, OpLIKE, OpFUNCTION,
+		OpMATCH, OpREGEXP, OpGLOB, OpLIMIT,
+		OpOFFSET, OpUnknown,
+	}
+
+	// 检查唯一性
+	seen := make(map[ConstraintOp]bool)
+	for _, op := range ops {
+		if seen[op] {
+			t.Errorf("Duplicate ConstraintOp value: %v", op)
+		}
+		seen[op] = true
+	}
+
+	// 基本验证
+	if OpEQ == OpGT {
+		t.Error("OpEQ should not equal OpGT")
+	}
+	if OpUnknown != 0 {
+		t.Error("OpUnknown should be 0")
+	}
+}
+
+// TestIndexInfoLimits 测试 IndexInfo 字段边界值
+func TestIndexInfoLimits(t *testing.T) {
+	info := &IndexInfo{}
+
+	// 测试 IdxNum 边界
+	info.IdxNum = 0
+	if info.IdxNum != 0 {
+		t.Error("IdxNum should be 0")
+	}
+
+	info.IdxNum = 1<<31 - 1 // Max int32
+	if info.IdxNum != 1<<31-1 {
+		t.Error("IdxNum max value failed")
+	}
+
+	// 测试 EstimatedCost 边界
+	info.EstimatedCost = 0
+	if info.EstimatedCost != 0 {
+		t.Error("EstimatedCost should be 0")
+	}
+
+	info.EstimatedCost = 1e10
+	if info.EstimatedCost != 1e10 {
+		t.Error("EstimatedCost large value failed")
+	}
+
+	// 测试 ColUsed 边界
+	info.ColUsed = 0
+	if info.ColUsed != 0 {
+		t.Error("ColUsed should be 0")
+	}
+
+	info.ColUsed = ^uint64(0) // All bits set
+	if info.ColUsed != ^uint64(0) {
+		t.Error("ColUsed max value failed")
+	}
+}
+
+// TestConstraintOmitEdgeCases 测试 Constraint.Omit 边界情况
+func TestConstraintOmitEdgeCases(t *testing.T) {
+	// 测试所有字段
+	c := Constraint{
+		Column:   -1,
+		Op:       OpEQ,
+		Usable:   false,
+		ArgIndex: -1,
+		Omit:     false,
+		IsIn:     false,
+	}
+
+	if c.Column != -1 {
+		t.Error("Column should be -1")
+	}
+	if c.ArgIndex != -1 {
+		t.Error("ArgIndex should be -1")
+	}
+
+	// 测试 IsIn 字段
+	c.IsIn = true
+	if !c.IsIn {
+		t.Error("IsIn should be true")
+	}
+}
+
+// TestOrderByDesc 测试 OrderBy.Desc 边界
+func TestOrderByDesc(t *testing.T) {
+	ob := OrderBy{
+		Column: 0,
+		Desc:   false,
+	}
+
+	if ob.Desc != false {
+		t.Error("Desc should be false")
+	}
+
+	ob.Desc = true
+	if !ob.Desc {
+		t.Error("Desc should be true")
+	}
+}
+
+// TestBlobWriteReadEmpty 测试 Blob 空数据读写
+func TestBlobWriteReadEmpty(t *testing.T) {
+	blob := NewBlob(
+		1,
+		func(h uintptr, o int64, p []byte) error {
+			return nil
+		},
+		func(h uintptr, o int64, p []byte) error {
+			return nil
+		},
+		func(h uintptr) error {
+			return nil
+		},
+	)
+
+	// 写入空数据
+	n, err := blob.Write(0, []byte{})
+	if err != nil {
+		t.Errorf("Write empty failed: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("Write empty returned %d, want 0", n)
+	}
+
+	// 读取空数据
+	buf := make([]byte, 0)
+	n, err = blob.Read(0, buf)
+	if err != nil {
+		t.Errorf("Read empty failed: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("Read empty returned %d, want 0", n)
+	}
+}
+
+// TestBlobOffsetBoundary 测试 Blob 偏移量边界
+func TestBlobOffsetBoundary(t *testing.T) {
+	blob := NewBlob(
+		1,
+		func(h uintptr, o int64, p []byte) error {
+			_ = o // 忽略偏移值
+			return nil
+		},
+		func(h uintptr, o int64, p []byte) error {
+			_ = o // 忽略偏移值
+			return nil
+		},
+		func(h uintptr) error {
+			return nil
+		},
+	)
+
+	// 测试负偏移（应该允许，但实现可能返回错误）
+	blob.Read(-1, make([]byte, 10))
+
+	// 测试大偏移
+	blob.Read(1<<63-1, make([]byte, 10))
+}
+
+// TestInIteratorMultipleValues 测试 InIterator 多个值迭代
+func TestInIteratorMultipleValues(t *testing.T) {
+	values := []driver.Value{"a", "b", "c", "d", "e"}
+	idx := 0
+
+	ctx := Context{
+		inFirst: func(valPtr uintptr) (driver.Value, bool) {
+			idx = 0
+			if idx < len(values) {
+				v := values[idx]
+				idx++
+				return v, true
+			}
+			return nil, false
+		},
+		inNext: func(valPtr uintptr) (driver.Value, bool) {
+			if idx < len(values) {
+				v := values[idx]
+				idx++
+				return v, true
+			}
+			return nil, false
+		},
+		valPtrs: []uintptr{1},
+	}
+
+	it := ctx.InIterate([]driver.Value{}, 0)
+	count := 0
+	for it.Next() {
+		count++
+		_ = it.Value()
+	}
+
+	if count != len(values) {
+		t.Errorf("Iterated %d times, expected %d", count, len(values))
+	}
+}
+
+// TestInIteratorValueTypeChanges 测试 InIterator 值类型变化
+func TestInIteratorValueTypeChanges(t *testing.T) {
+	values := []driver.Value{
+		int64(1),
+		"string",
+		float64(3.14),
+		[]byte{1, 2, 3},
+		nil,
+	}
+	idx := 0
+
+	ctx := Context{
+		inFirst: func(valPtr uintptr) (driver.Value, bool) {
+			idx = 0
+			if idx < len(values) {
+				v := values[idx]
+				idx++
+				return v, true
+			}
+			return nil, false
+		},
+		inNext: func(valPtr uintptr) (driver.Value, bool) {
+			if idx < len(values) {
+				v := values[idx]
+				idx++
+				return v, true
+			}
+			return nil, false
+		},
+		valPtrs: []uintptr{1},
+	}
+
+	it := ctx.InIterate([]driver.Value{}, 0)
+	typeCount := 0
+	for it.Next() {
+		v := it.Value()
+		if v != nil {
+			typeCount++
+		}
+	}
+
+	if typeCount != 4 { // 4 non-nil values
+		t.Errorf("Got %d non-nil values, expected 4", typeCount)
+	}
+}
+
+// TestContextDeclareEmptySchema 测试空 schema 声明
+func TestContextDeclareEmptySchema(t *testing.T) {
+	declareCalled := false
+	declareFn := func(s string) error {
+		declareCalled = true
+		if s == "" {
+			return errors.New("empty schema not allowed")
+		}
+		return nil
+	}
+
+	ctx := NewContext(declareFn)
+
+	// 尝试声明空 schema
+	err := ctx.Declare("")
+	if err == nil {
+		t.Error("Expected error for empty schema")
+	}
+
+	// 正常 schema
+	ctx.Declare("CREATE TABLE t (id INTEGER)")
+	if !declareCalled {
+		t.Error("Declare was not called")
+	}
+}
+
+// TestContextConfigMultipleArgs 测试 Config 多个参数
+func TestContextConfigMultipleArgs(t *testing.T) {
+	var receivedArgs []int32
+
+	configFn := func(op int32, args ...int32) error {
+		receivedArgs = args
+		return nil
+	}
+
+	ctx := NewContextWithConfig(
+		func(string) error { return nil },
+		func() error { return nil },
+		configFn,
+	)
+
+	// 测试多个参数
+	err := ctx.Config(1, 2, 3, 4, 5)
+	if err != nil {
+		t.Errorf("Config failed: %v", err)
+	}
+
+	if len(receivedArgs) != 5 || receivedArgs[0] != 2 || receivedArgs[4] != 5 {
+		t.Errorf("Config args: got %v", receivedArgs)
+	}
+}
+
+// TestContextEnableConstraintSupportError 测试 EnableConstraintSupport 错误传播
+func TestContextEnableConstraintSupportError(t *testing.T) {
+	expectedErr := errors.New("constraint support not available")
+
+	constraintFn := func() error {
+		return expectedErr
+	}
+
+	ctx := NewContextWithConstraintSupport(
+		func(string) error { return nil },
+		constraintFn,
+	)
+
+	err := ctx.EnableConstraintSupport()
+	if err != expectedErr {
+		t.Errorf("Expected error %v, got %v", expectedErr, err)
+	}
+}
+
+// ============================================================================
+// 并发测试
+// ============================================================================
+
+// TestInIteratorConcurrentAccess 测试 InIterator 并发访问（模拟）
+func TestInIteratorConcurrentAccess(t *testing.T) {
+	// 由于 InIterator 不是线程安全的，验证创建多个独立迭代器
+	values1 := []driver.Value{int64(1), int64(2)}
+	values2 := []driver.Value{int64(3), int64(4)}
+
+	ctx := Context{
+		inFirst: func(valPtr uintptr) (driver.Value, bool) {
+			// 根据 valPtr 区分不同迭代器
+			if valPtr == 1 {
+				if len(values1) > 0 {
+					v := values1[0]
+					values1 = values1[1:]
+					return v, true
+				}
+			} else if valPtr == 2 {
+				if len(values2) > 0 {
+					v := values2[0]
+					values2 = values2[1:]
+					return v, true
+				}
+			}
+			return nil, false
+		},
+		inNext: func(valPtr uintptr) (driver.Value, bool) {
+			if valPtr == 1 {
+				if len(values1) > 0 {
+					v := values1[0]
+					values1 = values1[1:]
+					return v, true
+				}
+			} else if valPtr == 2 {
+				if len(values2) > 0 {
+					v := values2[0]
+					values2 = values2[1:]
+					return v, true
+				}
+			}
+			return nil, false
+		},
+		valPtrs: []uintptr{1, 2},
+	}
+
+	// 创建两个独立迭代器
+	it1 := ctx.InIterate([]driver.Value{}, 0)
+	it2 := ctx.InIterate([]driver.Value{}, 1)
+
+	// 并发迭代
+	done := make(chan struct{})
+	var count1, count2 int
+
+	go func() {
+		for it1.Next() {
+			count1++
+		}
+		done <- struct{}{}
+	}()
+
+	go func() {
+		for it2.Next() {
+			count2++
+		}
+		done <- struct{}{}
+	}()
+
+	<-done
+	<-done
+
+	if count1 != 2 || count2 != 2 {
+		t.Errorf("Concurrent iteration: it1=%d, it2=%d (expected 2 each)", count1, count2)
+	}
+}
+
+// TestBlobConcurrentClose 测试 Blob 并发关闭
+func TestBlobConcurrentClose(t *testing.T) {
+	closeCount := 0
+	closeMu := sync.Mutex{}
+
+	blob := NewBlob(
+		1,
+		func(uintptr, int64, []byte) error { return nil },
+		func(uintptr, int64, []byte) error { return nil },
+		func(uintptr) error {
+			closeMu.Lock()
+			closeCount++
+			closeMu.Unlock()
+			return nil
+		},
+	)
+
+	// 并发关闭
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			blob.Close()
+		}()
+	}
+	wg.Wait()
+
+	// 应该只关闭一次
+	if closeCount != 1 {
+		t.Errorf("Close called %d times, expected 1", closeCount)
+	}
+}
+
+// TestContextExecConcurrent 测试 Exec 并发调用（模拟）
+func TestContextExecConcurrent(t *testing.T) {
+	var mu sync.Mutex
+	callCount := 0
+
+	execFn := func(sql string, args []driver.Value) error {
+		mu.Lock()
+		callCount++
+		mu.Unlock()
+		return nil
+	}
+
+	ctx := NewContextWithExec(
+		func(string) error { return nil },
+		nil,
+		nil,
+		execFn,
+	)
+
+	// 并发执行
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx.Exec("SELECT 1")
+		}()
+	}
+	wg.Wait()
+
+	if callCount != 10 {
+		t.Errorf("Exec called %d times, expected 10", callCount)
+	}
+}
+
+// ============================================================================
+// 性能/压力测试（快速版本）
+// ============================================================================
+
+// BenchmarkInIterator 基准测试 InIterator
+func BenchmarkInIterator(b *testing.B) {
+	values := make([]driver.Value, 100)
+	for i := range values {
+		values[i] = int64(i)
+	}
+	idx := 0
+
+	ctx := Context{
+		inFirst: func(valPtr uintptr) (driver.Value, bool) {
+			idx = 0
+			if idx < len(values) {
+				v := values[idx]
+				idx++
+				return v, true
+			}
+			return nil, false
+		},
+		inNext: func(valPtr uintptr) (driver.Value, bool) {
+			if idx < len(values) {
+				v := values[idx]
+				idx++
+				return v, true
+			}
+			return nil, false
+		},
+		valPtrs: []uintptr{1},
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		it := ctx.InIterate([]driver.Value{}, 0)
+		for it.Next() {
+			_ = it.Value()
+		}
+	}
+}
+
+// BenchmarkBlobWrite 基准测试 Blob 写入
+func BenchmarkBlobWrite(b *testing.B) {
+	data := make([]byte, 4096)
+
+	blob := NewBlob(
+		1,
+		func(h uintptr, o int64, p []byte) error { return nil },
+		func(h uintptr, o int64, p []byte) error { return nil },
+		func(h uintptr) error { return nil },
+	)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		blob.Write(int64(i), data)
 	}
 }

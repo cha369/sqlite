@@ -839,6 +839,7 @@ func vtabBindValue(tls *libc.TLS, stmt uintptr, idx int32, val driver.Value) err
 			}
 			copy((*libc.RawMem)(unsafe.Pointer(p))[:len(v):len(v)], v)
 			sqlite3.Xsqlite3_bind_blob(tls, stmt, idx, p, int32(len(v)), sqlite3.SQLITE_TRANSIENT)
+			sqlite3.Xsqlite3_free(tls, p)
 		}
 	case bool:
 		if v {
@@ -1026,16 +1027,20 @@ func vtabUpdateTrampoline(tls *libc.TLS, pVtab uintptr, argc int32, argv uintptr
 			return sqlite3.SQLITE_OK
 		}
 
-		// INSERT or UPDATE
+		// INSERT or UPDATE: argc == N+2. argv[0]=oldRowid (NULL for insert),
+		// argv[1]=newRowid (or desired rowid for insert, may be NULL),
+		// argv[2..N+1]=column values.
 		if argc < 3 {
 			return sqlite3.SQLITE_MISUSE
 		}
 		nCols := argc - 2
-		colsPtr := argv + uintptr(1)*sqliteValPtrSize
+		// Extract column values (columns start from argv[2])
+		colsPtr := argv + uintptr(2)*sqliteValPtrSize
 		cols := functionArgs(tls, nCols, colsPtr)
 
+		// argv[0]=oldRowid (NULL for insert), argv[1]=newRowid
 		oldPtr := *(*uintptr)(unsafe.Pointer(argv + uintptr(0)*sqliteValPtrSize))
-		newPtr := *(*uintptr)(unsafe.Pointer(argv + uintptr(argc-1)*sqliteValPtrSize))
+		newPtr := *(*uintptr)(unsafe.Pointer(argv + uintptr(1)*sqliteValPtrSize))
 
 		oldIsNull := sqlite3.Xsqlite3_value_type(tls, oldPtr) == sqlite3.SQLITE_NULL
 		newIsNull := sqlite3.Xsqlite3_value_type(tls, newPtr) == sqlite3.SQLITE_NULL
@@ -1114,18 +1119,19 @@ func vtabUpdateTrampoline(tls *libc.TLS, pVtab uintptr, argc int32, argv uintptr
 	}
 
 	// INSERT or UPDATE: argc == N+2. argv[0]=oldRowid (NULL for insert),
-	// argv[1..N]=column values, argv[N+1]=newRowid (or desired rowid for insert, may be NULL).
+	// argv[1]=newRowid (or desired rowid for insert, may be NULL),
+	// argv[2..N+1]=column values.
 	if argc < 3 {
 		return sqlite3.SQLITE_MISUSE
 	}
 	nCols := argc - 2
-	// Extract column values
-	colsPtr := argv + uintptr(1)*sqliteValPtrSize
+	// Extract column values (columns start from argv[2])
+	colsPtr := argv + uintptr(2)*sqliteValPtrSize
 	cols := functionArgs(tls, nCols, colsPtr)
 
-	// Determine old/new rowid
+	// argv[0]=oldRowid (NULL for insert), argv[1]=newRowid
 	oldPtr := *(*uintptr)(unsafe.Pointer(argv + uintptr(0)*sqliteValPtrSize))
-	newPtr := *(*uintptr)(unsafe.Pointer(argv + uintptr(argc-1)*sqliteValPtrSize))
+	newPtr := *(*uintptr)(unsafe.Pointer(argv + uintptr(1)*sqliteValPtrSize))
 
 	oldIsNull := sqlite3.Xsqlite3_value_type(tls, oldPtr) == sqlite3.SQLITE_NULL
 	newIsNull := sqlite3.Xsqlite3_value_type(tls, newPtr) == sqlite3.SQLITE_NULL
